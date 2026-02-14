@@ -3,13 +3,14 @@ import torch
 import torch.optim as optim
 import csv
 import os
+from tqdm import tqdm  # <--- NEW IMPORT
 from src.dataset import get_dataloaders
-from src.model import ResNetVAE, vae_loss_function  # Or SimpleVAE if you chose that
+from src.model import ResNetVAE, vae_loss_function 
 from src.utils import calculate_psnr, get_flops, probe_accuracy_auc
 
 # --- Configuration ---
-DATASET_PATH = "data/brisc2025" 
-BATCH_SIZE = 16
+DATASET_PATH = "../Dataset/brisc2025" 
+BATCH_SIZE = 32
 EPOCHS = 50
 LR = 1e-3
 LATENT_DIM = 128
@@ -33,8 +34,6 @@ def main():
 
     # 4. Initialize CSV Logging
     headers = ["Epoch", "Train_Loss", "Train_PSNR", "Val_Accuracy", "Val_AUC", "Time(s)", "Latency(ms)", "VRAM(MB)", "FLOPS(G)"]
-    
-    # Create file and write headers if it doesn't exist
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, mode='w', newline='') as f:
             writer = csv.writer(f)
@@ -47,15 +46,18 @@ def main():
         model.train()
         start_time = time.time()
         
-        # Reset VRAM tracking
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         
         train_loss = 0
         total_psnr = 0
         
-        # Training Step
-        for batch_idx, (data, _) in enumerate(train_loader):
+        # --- TQDM Progress Bar Start ---
+        # We wrap the train_loader with tqdm to create the bar
+        loop = tqdm(train_loader, leave=True)
+        loop.set_description(f"Epoch [{epoch+1}/{EPOCHS}]")
+        
+        for batch_idx, (data, _) in enumerate(loop):
             data = data.to(DEVICE)
             optimizer.zero_grad()
             
@@ -65,58 +67,55 @@ def main():
             loss.backward()
             optimizer.step()
             
+            # Update metrics
             train_loss += loss.item()
-            total_psnr += calculate_psnr(recon_batch, data).item()
+            current_psnr = calculate_psnr(recon_batch, data).item()
+            total_psnr += current_psnr
+            
+            # Update the progress bar text immediately
+            loop.set_postfix(loss=loss.item(), psnr=current_psnr)
+        # --- TQDM Progress Bar End ---
 
         # End of Epoch Timing
         epoch_duration = time.time() - start_time
         
-        # Inference Latency Check (One pass)
+        # Inference Latency Check
         infer_start = time.time()
         with torch.no_grad():
-            _ = model(data[0:1]) # Single image inference
-        inference_latency = (time.time() - infer_start) * 1000 # ms
+            _ = model(data[0:1]) 
+        inference_latency = (time.time() - infer_start) * 1000 
 
         # VRAM Usage
         vram_usage = 0
         if torch.cuda.is_available():
-            vram_usage = torch.cuda.max_memory_allocated() / (1024 ** 2) # MB
+            vram_usage = torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-        # Validation & Probing
-        # We use Accuracy as the metric to decide "Best Model"
+        # Validation Probe
+        # (We print this on a new line so it doesn't mess up the progress bar)
         val_acc, val_auc = probe_accuracy_auc(model, test_loader, DEVICE)
 
         avg_loss = train_loss / len(train_loader)
         avg_psnr = total_psnr / len(train_loader)
 
-        # Console Log
-        print(f"Epoch [{epoch+1}/{EPOCHS}] "
-              f"Loss: {avg_loss:.4f} | PSNR: {avg_psnr:.2f}dB | "
-              f"Latent Acc: {val_acc:.4f} | AUC: {val_auc:.4f}")
+        # Print Summary
+        print(f" -> Val Acc: {val_acc:.4f} | AUC: {val_auc:.4f} | Time: {epoch_duration:.2f}s")
 
-        # --- CSV Logging ---
+        # Log to CSV
         with open(LOG_FILE, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                epoch + 1,
-                f"{avg_loss:.4f}",
-                f"{avg_psnr:.2f}",
-                f"{val_acc:.4f}",
-                f"{val_auc:.4f}",
-                f"{epoch_duration:.2f}",
-                f"{inference_latency:.2f}",
-                f"{vram_usage:.2f}",
-                f"{flops_g:.2f}"
+                epoch + 1, f"{avg_loss:.4f}", f"{avg_psnr:.2f}", f"{val_acc:.4f}",
+                f"{val_auc:.4f}", f"{epoch_duration:.2f}", f"{inference_latency:.2f}",
+                f"{vram_usage:.2f}", f"{flops_g:.2f}"
             ])
 
-        # --- Save Best Model ---
-        # We save if the Unsupervised Latent Accuracy improves
+        # Save Best Model
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
             torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"--> Best Model Saved (Accuracy: {best_val_accuracy:.4f})")
+            print(f"   --> New Best Model Saved! (Acc: {best_val_accuracy:.4f})")
 
-    print("Training Complete. Check 'training_log.csv' for details.")
+    print("Training Complete.")
 
 if __name__ == "__main__":
     main()
