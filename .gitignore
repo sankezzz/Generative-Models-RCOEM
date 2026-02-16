@@ -2,3 +2,4 @@ Dataset
 models
 __pycache__
 VAE/best_brisc_vae.pth
+gan_latest.pth
