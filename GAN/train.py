@@ -7,7 +7,7 @@ import time
 import numpy as np
 from tqdm import tqdm
 from torchvision.utils import save_image
-from thop import profile # Required for GFLOPS
+from thop import profile 
 
 from src.dataset import get_dataloaders
 from src.model import Generator, Discriminator
@@ -16,14 +16,15 @@ from src.utils import initialize_weights, get_d_accuracy
 # --- Config ---
 DATASET_PATH = "../Dataset/brisc2025" 
 BATCH_SIZE = 32
-EPOCHS = 100
+EPOCHS = 50
 LR = 0.0002
 Z_DIM = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Files
 LOG_FILE = "gan_training_log.csv"
-CHECKPOINT_PATH = "gan_latest.pth"
+CHECKPOINT_PATH = "gan_latest.pth"          # <--- RESUME FILE (Overwritten)
+BEST_MODEL_PATH = "best_generator.pth"      # <--- BEST MODEL (Saved only when good)
 IMG_SAVE_DIR = "generated_images"
 
 os.makedirs(IMG_SAVE_DIR, exist_ok=True)
@@ -32,9 +33,10 @@ def get_generator_flops(model, z_dim, device):
     """Calculates GFLOPS for the Generator."""
     dummy_input = torch.randn(1, z_dim).to(device)
     macs, params = profile(model, inputs=(dummy_input, ), verbose=False)
-    return (2 * macs) / 1e9 # Convert to GFLOPS
+    return (2 * macs) / 1e9 
 
 def save_checkpoint(gen, disc, opt_gen, opt_disc, epoch, filename=CHECKPOINT_PATH):
+    """Saves full training state for resuming."""
     state = {
         'epoch': epoch,
         'gen_state_dict': gen.state_dict(),
@@ -58,24 +60,20 @@ def load_checkpoint(gen, disc, opt_gen, opt_disc, filename=CHECKPOINT_PATH):
 def main():
     loader = get_dataloaders(DATASET_PATH, BATCH_SIZE)
     
-    # Init Models
     gen = Generator(Z_DIM).to(DEVICE)
     disc = Discriminator().to(DEVICE)
     initialize_weights(gen)
     initialize_weights(disc)
     
-    # Optimizers
     opt_gen = optim.Adam(gen.parameters(), lr=LR, betas=(0.5, 0.999))
     opt_disc = optim.Adam(disc.parameters(), lr=LR, betas=(0.5, 0.999))
     criterion = nn.BCELoss()
     fixed_noise = torch.randn(16, Z_DIM).to(DEVICE)
     
-    # --- Calculate Static Metrics (GFLOPS) ---
+    # Static Metrics
     try:
         g_flops = get_generator_flops(gen, Z_DIM, DEVICE)
-        print(f"Generator Complexity: {g_flops:.2f} GFLOPS")
-    except Exception as e:
-        print(f"Warning: Could not calc FLOPS ({e})")
+    except:
         g_flops = 0.0
 
     # CSV Headers
@@ -85,13 +83,13 @@ def main():
             csv.writer(f).writerow(headers)
 
     start_epoch = load_checkpoint(gen, disc, opt_gen, opt_disc)
+    best_variance = 0.0 # Heuristic for "Best" model (Highest diversity without collapse)
 
     print(f"Starting GAN Training on {DEVICE}...")
 
     for epoch in range(start_epoch - 1, EPOCHS):
         start_time = time.time()
         
-        # Reset VRAM tracking
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -147,29 +145,36 @@ def main():
         avg_var = epoch_var / len(loader)
         duration = time.time() - start_time
         
-        # 1. Inference Latency (Generator only)
+        # Latency & VRAM
         start_infer = time.time()
         with torch.no_grad():
-            _ = gen(fixed_noise[0:1]) # Generate 1 image
+            _ = gen(fixed_noise[0:1]) 
         latency_ms = (time.time() - start_infer) * 1000
         
-        # 2. VRAM Usage
         vram_usage = 0
         if torch.cuda.is_available():
             vram_usage = torch.cuda.max_memory_allocated() / (1024 ** 2)
 
-        # Log Status
         status = "🟢 OK"
         if avg_acc > 0.95: status = "🔴 D Winning"
         if avg_acc < 0.05: status = "🔴 G Winning"
         if avg_var < 0.001: status = "💀 COLLAPSED"
         
-        print(f" -> D_Acc: {avg_acc:.2f} | Latency: {latency_ms:.2f}ms | VRAM: {vram_usage:.2f}MB | Status: {status}")
+        print(f" -> D_Acc: {avg_acc:.3f} | Latency: {latency_ms:.3f}ms | VRAM: {vram_usage:.3f}MB | Status: {status}")
         
-        # Save Checkpoint
+        # --- SAVE LOGIC ---
+        
+        # 1. ALWAYS save Resume Checkpoint (Overwrites previous)
         save_checkpoint(gen, disc, opt_gen, opt_disc, epoch+1)
         
-        # Log to CSV
+        # 2. INTELLIGENT "Best Model" Save
+        # Condition: Model must be stable (Acc 0.4-0.6) AND have high variance (Diversity)
+        if 0.40 < avg_acc < 0.60 and avg_var > best_variance:
+            best_variance = avg_var
+            torch.save(gen.state_dict(), BEST_MODEL_PATH)
+            print(f"    💎 New Best Generator Found! (Stable Acc & High Var: {avg_var:.4f})")
+
+        # 3. Log to CSV
         with open(LOG_FILE, 'a', newline='') as f:
             csv.writer(f).writerow([
                 epoch+1, 
@@ -182,12 +187,13 @@ def main():
                 f"{vram_usage:.3f}", 
                 f"{g_flops:.3f}"
             ])
-        # Save Visual Snapshot
+
+        # 4. Save Visual Snapshot (Overwrites old snapshot to save space)
         if (epoch+1) % 5 == 0:
             with torch.no_grad():
                 fake_images = gen(fixed_noise)
                 fake_images = (fake_images * 0.5) + 0.5
-                save_image(fake_images, f"{IMG_SAVE_DIR}/epoch_{epoch+1}.png")
+                save_image(fake_images, f"{IMG_SAVE_DIR}/latest_generated.png")
 
 if __name__ == "__main__":
     main()
