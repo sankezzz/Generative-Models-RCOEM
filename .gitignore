@@ -3,3 +3,6 @@ models
 __pycache__
 VAE/best_brisc_vae.pth
 gan_latest.pth
+best_model
+Trials
+checkpoints
